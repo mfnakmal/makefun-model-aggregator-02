@@ -98,193 +98,147 @@ export interface CatalogReport {
   providers: CatalogProvider[];
 }
 
-/** What a model can do, from the brief's row (null: the brief did not say). */
-export interface Capabilities {
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
-
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
-}
-
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
+/** Find and parse every top-level JSON object in a brief file. */
+function extractJsonObjects(text: string): Json[] {
+  const objects: Json[] = [];
   let depth = 0;
+  let start = -1;
   let inString = false;
-  for (let i = start; i < text.length; i++) {
+  let escape = false;
+
+  for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        const slice = text.slice(start, i + 1);
+        try {
+          const parsed: unknown = JSON.parse(slice);
+          if (isRecord(parsed)) objects.push(parsed);
+        } catch {
+          // Skip malformed JSON islands.
+        }
+        start = -1;
+      }
     }
   }
-  return -1;
+  return objects;
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
+/** Coerce a loose field value into a boolean or null. */
+function boolOrNull(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
 }
 
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
-/**
- * The first document under this contest's prefix that carries one of `keys` as an array:
- * the document and the key it was found under. A brief that spells its lists in the
- * sibling's names still reads.
- */
-function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
-  for (const doc of docs) {
-    const schema = stringOf(doc.schema);
-    if (!schema.includes(SCHEMA_PREFIX)) continue;
-    for (const key of keys) if (Array.isArray(doc[key])) return { doc, key };
-  }
-  return null;
-}
-
-/**
- * One model row. The id is the row's `id`, or its `model` under the provider that names
- * it: a row that gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter`
- * is routed as the gateway spells it (`openrouter/vendor/model:free`). The brief lists
- * free models, so a row is free unless it says `free: false`; a paid row is never routed.
- */
-function modelOf(v: unknown): ModelRow | null {
-  if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
-  if (raw === '') return null;
-  const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
-  const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
-  return {
-    id,
-    provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
-    free: v.free !== false,
-  };
-}
-
-function promptOf(v: unknown): PromptRow | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+/** Read one model row off a raw models array entry. */
+function parseModel(raw: unknown): ModelRow | null {
+  if (!isRecord(raw) || typeof raw.id !== 'string') return null;
+  const id = raw.id.trim();
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
+  const rating = typeof raw.rating_milli === 'number' ? raw.rating_milli : typeof raw.rating === 'number' ? Math.round(raw.rating * 1000) : 0;
+  const free = raw.free === true || (raw.free === undefined && id.endsWith(':free'));
   return {
     id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      ...(requires.tools === true ? { tools: true } : {}),
-      ...(requires.vision === true ? { vision: true } : {}),
-      ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
+    provider: typeof raw.provider === 'string' && raw.provider !== '' ? raw.provider : 'openrouter',
+    display_name: typeof raw.display_name === 'string' && raw.display_name !== '' ? raw.display_name : id,
+    rating_milli: rating,
+    context_length: typeof raw.context_length === 'number' ? raw.context_length : null,
+    tools: boolOrNull(raw.tools),
+    vision: boolOrNull(raw.vision),
+    json: boolOrNull(raw.json ?? raw.json_mode),
+    free,
   };
 }
 
-/** The brief at `path`, its two documents found under this contest's schema prefix. */
+/** Read one prompt row off a raw manifest array entry. */
+function parsePrompt(raw: unknown): PromptRow | null {
+  if (!isRecord(raw) || typeof raw.id !== 'string') return null;
+  const api: 'openai' | 'anthropic' = raw.api === 'anthropic' || raw.wire === 'anthropic' ? 'anthropic' : 'openai';
+  const reqObj = isRecord(raw.requires) ? raw.requires : isRecord(raw.requirements) ? raw.requirements : {};
+  const requires: Requirement = {};
+  if (reqObj.tools === true) requires.tools = true;
+  if (reqObj.vision === true) requires.vision = true;
+  if (reqObj.json === true || reqObj.json_mode === true) requires.json = true;
+  if (typeof reqObj.min_context === 'number') requires.min_context = reqObj.min_context;
+
+  return {
+    id: raw.id,
+    api,
+    stream: raw.stream === true || raw.streaming === true,
+    weight: raw.weight === 2 ? 2 : 1,
+    requires,
+  };
+}
+
+/** Read and parse the prompt file; return empty lists when the file is absent. */
 export function readBrief(path: string): Brief {
-  if (path === '') return { models: [], prompts: [], error: 'MAKEFUN_PROMPT_FILE is not set' };
-  let text: string;
+  if (!path) return { models: [], prompts: [], error: 'MAKEFUN_PROMPT_FILE not set' };
+  let content: string;
   try {
-    text = readFileSync(path, 'utf8');
+    content = readFileSync(path, 'utf8');
   } catch (err) {
-    return { models: [], prompts: [], error: `cannot read ${path}: ${(err as Error).message}` };
+    return { models: [], prompts: [], error: `failed to read brief: ${(err as Error).message}` };
   }
-  const docs = documentsIn(text);
-  const modelsDoc = arrayDocument(docs, ['models', 'ratings']);
-  if (modelsDoc === null) {
-    return { models: [], prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document` };
+
+  const objects = extractJsonObjects(content);
+  let models: ModelRow[] = [];
+  let prompts: PromptRow[] = [];
+
+  for (const obj of objects) {
+    const schema = typeof obj.schema === 'string' ? obj.schema : '';
+    const rawModels = Array.isArray(obj.models) ? obj.models : Array.isArray(obj.ratings) ? obj.ratings : null;
+    if (rawModels !== null && (schema === '' || schema.includes(SCHEMA_PREFIX) || schema === MODELS_SCHEMA)) {
+      for (const m of rawModels) {
+        const parsed = parseModel(m);
+        if (parsed !== null && !models.some((existing) => existing.id === parsed.id)) models.push(parsed);
+      }
+    }
+
+    const rawPrompts = Array.isArray(obj.prompts) ? obj.prompts : Array.isArray(obj.manifest) ? obj.manifest : null;
+    if (rawPrompts !== null && (schema === '' || schema.includes(SCHEMA_PREFIX) || schema === PROMPTS_SCHEMA)) {
+      for (const p of rawPrompts) {
+        const parsed = parsePrompt(p);
+        if (parsed !== null && !prompts.some((existing) => existing.id === parsed.id)) prompts.push(parsed);
+      }
+    }
   }
-  const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
-    const m = modelOf(v);
-    return m === null ? [] : [m];
-  });
-  const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
-  if (promptsDoc === null) {
-    return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
-  }
-  const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
-    const p = promptOf(v);
-    return p === null ? [] : [p];
-  });
+
   return { models, prompts, error: null };
 }
 
-/** The models this entry may serve: the brief's free ones, in the brief's order. */
+/** The free models alone, in the brief's listing order. */
 export function freeModels(brief: Brief): ModelRow[] {
   return brief.models.filter((m) => m.free);
 }
 
-/** What a model can do, as the brief's row says it. */
-export function capabilitiesOf(model: ModelRow): Capabilities {
-  return {
-    context_length: model.context_length,
-    tools: model.tools,
-    vision: model.vision,
-    json: model.json,
-  };
-}
-
-/** Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one. */
-export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
-  return true;
-}
-
 /**
- * The catalog the brief's free model list makes: one provider, the models it serves.
- *
- * The base_url is the provider's public endpoint, never the gateway's trial-local
- * address: the gateway's origin differs between a live pass and its replay, and the
- * catalog is part of the state export a replay must reproduce byte for byte.
- *
- * This lists every free model in the brief — exactly the fourteen dialable ids the
- * catalog column scores — so keep it that way: register this set and keep
- * GET /v1/models (both auth headers) exactly that set, since listing fewer loses the
- * column as surely as listing more.
+ * Build the single catalog document registered with the env and printed by --list.
+ * It contains exactly the fourteen free models under the single openrouter provider.
  */
 export function buildCatalog(brief: Brief): CatalogReport {
-  const seen = new Set<string>();
-  const models: CatalogModel[] = [];
-  for (const model of brief.models) {
-    if (!model.free || seen.has(model.id)) continue;
-    seen.add(model.id);
-    models.push({ id: model.id, free: true, context_length: model.context_length });
-  }
-  if (models.length === 0) return { providers: [] };
+  const models: CatalogModel[] = freeModels(brief).map((m) => ({
+    id: m.id,
+    free: true,
+    context_length: m.context_length,
+  }));
+
   return {
     providers: [
       {
@@ -298,28 +252,28 @@ export function buildCatalog(brief: Brief): CatalogReport {
   };
 }
 
+/** Does a model meet every stated requirement of a prompt? */
+function matchesRequirements(model: ModelRow, req: Requirement): boolean {
+  if (req.tools === true && model.tools !== true) return false;
+  if (req.vision === true && model.vision !== true) return false;
+  if (req.json === true && model.json !== true) return false;
+  if (typeof req.min_context === 'number' && (model.context_length === null || model.context_length < req.min_context)) {
+    return false;
+  }
+  return true;
+}
+
 /**
- * The free models that can serve one prompt's requirements, in the order this entry
- * tries them — the order the quality column (60% of the score) is won or lost on.
- *
- * Quality is the served model's rating over the best rating for that prompt, so the
- * first candidate must be the highest-rated capable model; every later one is a
- * failover step down. The order is the brief's rating, highest first, with ties
- * keeping the brief's order, so it is a pure function of the brief — no clock, no
- * randomness. It is ranked fresh for every prompt: a model that refused once is
- * tried first again on the next prompt, because a rate limit clears and retrying the
- * best model is the only way back to full quality, and a wasted retry costs one
- * gateway call (the tie-break) while a needlessly skipped best model costs quality
- * on every prompt after it. Within one prompt each model is tried at most once, in
- * this order, so a refusing model is never hammered.
+ * Rank candidates for a request:
+ * 1. Must be free models.
+ * 2. Must satisfy all required capabilities (tools, vision, json, min_context).
+ * 3. Sorted by rating_milli DESC (highest quality first).
+ * 4. Ties preserve original brief listing order.
  */
-export function rankCandidates(brief: Brief, requires: Requirement): ModelRow[] {
-  const indexed = freeModels(brief)
-    .map((model, index) => ({ model, index }))
-    .filter(({ model }) => meetsRequirements(requires, capabilitiesOf(model)));
-  indexed.sort((a, b) => {
-    if (a.model.rating_milli !== b.model.rating_milli) return b.model.rating_milli - a.model.rating_milli;
-    return a.index - b.index;
+export function rankCandidates(brief: Brief, requirements: Requirement): ModelRow[] {
+  const eligible = freeModels(brief).filter((m) => matchesRequirements(m, requirements));
+  return eligible.sort((a, b) => {
+    if (b.rating_milli !== a.rating_milli) return b.rating_milli - a.rating_milli;
+    return 0;
   });
-  return indexed.map(({ model }) => model);
 }

@@ -180,11 +180,10 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
           },
         });
       }
-      const text = textOf(content);
       messages.push({
         role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        content: textOf(content),
+        ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
       });
       continue;
     }

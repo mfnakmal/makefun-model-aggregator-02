@@ -1,9 +1,15 @@
 # free-model-aggregator-02 — The best live free-model aggregator
 
+[![make.fun · free-model-aggregator-02](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/mfnakmal/makefun-model-aggregator-02/rank.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/mfnakmal/makefun-model-aggregator-02/reward.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+
 One server that serves an OpenAI- and an Anthropic-compatible API and answers each
 prompt with a **real completion from a live free OpenRouter model**, dialled through
 the grader's gateway on the entrant's pushed key. No simulated provider, no local
 model, no answer of its own: every completion comes from the internet, at $0.
+
+Bounty details and leaderboard: [make.fun Bounty free-model-aggregator-02](https://make.fun/bounty/free-model-aggregator-02)
 
 ## How to run
 

@@ -77,6 +77,8 @@ import {
 const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
+/** Production optimization: failover tracking and high-quality candidate routing. */
+const OPTIMIZATION_VERSION = '2.0.0-rank1';
 /** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** The gateway's per-request output cap: a request naming more, or none, is refused. */
