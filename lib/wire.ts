@@ -1,504 +1,402 @@
-// The client wires, the one upstream wire, and the model field.
-//
-// The trial's client calls this entry as an OpenAI service (POST /v1/chat/completions)
-// or an Anthropic one (POST /v1/messages), with a JSON body or with server-sent events.
-// The entry dials the grader's gateway, an OpenAI-compatible endpoint, so every prompt
-// goes upstream as a Chat Completions request and the Anthropic path is translated both
-// ways:
-//
-//   - the OpenAI path passes the client's body (with the dialled model's id) to the
-//     gateway and relays the gateway's JSON or SSE answer, with every `model` field set
-//     to the id this entry dialled;
-//   - the Anthropic path rewrites the request to Chat Completions (system prompt, image
-//     blocks, tool definitions, tool results and tool choice included) and rewrites the
-//     gateway's answer into a Messages object, or into the message_start /
-//     content_block_start / content_block_delta / content_block_stop / message_delta /
-//     message_stop event order, with the stop reason and the usage translated. Tool calls
-//     become tool_use blocks and input_json_delta events.
-//
-// THE MODEL FIELD
-//   The house records every gateway call and scores the model that really answered, so a
-//   response's `model` must be the model this entry dialled. OpenRouter's own answer
-//   names a free model without the gateway's `openrouter/` prefix; these functions put
-//   the dialled id back on every answer and every streamed chunk. They never make a
-//   model up: the id came from the brief and went to the gateway in the request's `model`.
-//
-// THE USAGE
-//   The wire column wants a whole usage count: an input of at least 0 and an output of
-//   at least 1. A real gateway answer carries one; when it does not (or its output count
-//   is 0 while the answer has text), the translators fill the output count from the
-//   answer's own length, never from nothing — a served prompt always produced output.
-//
-// Everything here is a pure function of its arguments, except the stream relays: no
-// clock and no randomness, so the same body and the same gateway answer give the same
-// bytes on a replay. The two model listings use fixed timestamps for the same reason:
-// a `created` that moved between runs would be a nondeterministic document.
+// free-model-aggregator-02: Wire Translation Layer
+// Translates between OpenAI and Anthropic protocol specifications
+// Zero external dependencies — built strictly on Node.js 22 runtime standard library.
 
-import { isRecord, type Json } from './providers.ts';
+import { type ReadableStream } from 'node:stream/web';
+import { type Json, isRecord } from './providers.ts';
 
-/** One model the entry serves, as GET /v1/models lists it. */
 export interface ServedModel {
   id: string;
-  provider: string;
-  display_name: string;
 }
 
-/** A fixed epoch second for every listed model's `created`: nothing in the reply reads the clock. */
-const FIXED_OPENAI_CREATED = 1767225600;
-/** A fixed instant for every listed model's `created_at`: nothing in the reply reads the clock. */
-const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
-
-/** GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape. */
+/** Format model list response in OpenAI representation */
 export function openAIModelList(models: readonly ServedModel[]): Json {
   return {
     object: 'list',
-    data: models.map((m) => ({ id: m.id, object: 'model', created: FIXED_OPENAI_CREATED, owned_by: m.provider })),
+    data: models.map((m) => ({
+      id: m.id,
+      object: 'model',
+      created: 1700000000,
+      owned_by: 'openrouter',
+    })),
   };
 }
 
-/** GET /v1/models on an Anthropic-shaped request (an x-api-key header): Anthropic's model list shape. */
+/** Format model list response in Anthropic representation */
 export function anthropicModelList(models: readonly ServedModel[]): Json {
   return {
-    data: models.map((m) => ({ type: 'model', id: m.id, display_name: m.display_name, created_at: FIXED_ANTHROPIC_CREATED_AT })),
+    data: models.map((m) => ({
+      id: m.id,
+      type: 'model',
+      display_name: m.id.replace(/^openrouter\//, ''),
+      created_at: 1700000000,
+    })),
     has_more: false,
   };
 }
 
-/** An error in Anthropic's shape (the Messages API's error envelope). */
+/** Format error object conforming to Anthropic error specification */
 export function anthropicError(type: string, message: string): Json {
-  return { type: 'error', error: { type, message } };
-}
-
-/** An error in OpenAI's shape (Chat Completions). */
-export function openAIError(message: string, type: string, code: string | null): Json {
-  return { error: { message, type, code } };
-}
-
-/** A count that is a whole number of at least 0, else 0. */
-function countOrZero(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
-}
-
-/**
- * A whole OpenAI usage object: input at least 0, output at least 1. The gateway's own
- * counts are used when they are whole; when the output count is missing or 0 while the
- * answer has text, it is estimated from that text (about four characters a token),
- * because a served prompt always produced output and the wire column reads this.
- */
-export function wholeUsage(usage: unknown, text: string): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
-  const record = isRecord(usage) ? usage : {};
-  const prompt = countOrZero(record.prompt_tokens);
-  let completion = countOrZero(record.completion_tokens);
-  if (completion < 1) completion = Math.max(1, Math.ceil(text.length / 4));
-  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
-}
-
-/** The text of a string or of a block array's text blocks; '' when there is none. */
-function textOf(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
-}
-
-/** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
-function partOf(block: Json): Json | null {
-  if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
-  if (block.type === 'image' && isRecord(block.source)) {
-    const source = block.source;
-    if (source.type === 'base64' && typeof source.data === 'string') {
-      const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
-      return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
-    }
-    if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
-  }
-  return null;
-}
-
-/** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
-function toolResultText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const text = textOf(content);
-    return text !== '' ? text : JSON.stringify(content);
-  }
-  return content === undefined ? '' : JSON.stringify(content);
-}
-
-/** A tool call's arguments as an object: the gateway's JSON string, or {} when it is not one. */
-function argumentsOf(value: unknown): Json {
-  if (isRecord(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      if (isRecord(parsed)) return parsed;
-    } catch {
-      // Not JSON: an empty input.
-    }
-  }
-  return {};
-}
-
-/** OpenAI's finish_reason as Anthropic's stop_reason. */
-export function stopReasonOf(finish: unknown): string {
-  if (finish === 'length') return 'max_tokens';
-  if (finish === 'tool_calls' || finish === 'function_call') return 'tool_use';
-  if (finish === 'content_filter') return 'refusal';
-  return 'end_turn';
-}
-
-/**
- * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`:
- * the system prompt becomes a system message, image blocks become image_url data URLs,
- * tool_use blocks become tool_calls, tool_result blocks become tool messages, tools and
- * tool_choice are rewritten, and the output cap, temperature, top_p, stop sequences and
- * streaming pass through (streaming asks for the usage chunk too).
- */
-export function anthropicToOpenAI(body: Json, model: string): Json {
-  const messages: Json[] = [];
-  const system = textOf(body.system);
-  if (system !== '') messages.push({ role: 'system', content: system });
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const assistant = raw.role === 'assistant';
-    const content = raw.content;
-    if (typeof content === 'string') {
-      messages.push({ role: assistant ? 'assistant' : 'user', content });
-      continue;
-    }
-    if (!Array.isArray(content)) continue;
-    if (assistant) {
-      const toolCalls: Json[] = [];
-      for (const block of content) {
-        if (!isRecord(block) || block.type !== 'tool_use') continue;
-        toolCalls.push({
-          id: typeof block.id === 'string' ? block.id : '',
-          type: 'function',
-          function: {
-            name: typeof block.name === 'string' ? block.name : '',
-            arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
-          },
-        });
-      }
-      messages.push({
-        role: 'assistant',
-        content: textOf(content),
-        ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
-      });
-      continue;
-    }
-    const parts: Json[] = [];
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === 'tool_result') {
-        messages.push({
-          role: 'tool',
-          tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
-        });
-        continue;
-      }
-      const part = partOf(block);
-      if (part !== null) parts.push(part);
-    }
-    if (parts.length > 0) messages.push({ role: 'user', content: parts });
-  }
-
-  const out: Json = { model, messages };
-  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
-  if (typeof body.temperature === 'number') out.temperature = body.temperature;
-  if (typeof body.top_p === 'number') out.top_p = body.top_p;
-  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
-  if (Array.isArray(body.tools)) {
-    const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== 'string') return [];
-      return [
-        {
-          type: 'function',
-          function: {
-            name: raw.name,
-            description: typeof raw.description === 'string' ? raw.description : '',
-            parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
-          },
-        },
-      ];
-    });
-    if (tools.length > 0) out.tools = tools;
-  }
-  const choice = body.tool_choice;
-  if (isRecord(choice)) {
-    if (choice.type === 'auto') out.tool_choice = 'auto';
-    else if (choice.type === 'any') out.tool_choice = 'required';
-    else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
-  }
-  if (body.stream === true) {
-    out.stream = true;
-    out.stream_options = { include_usage: true };
-  }
-  return out;
-}
-
-/** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-export function openAIToAnthropic(body: Json, model: string): Json {
-  const choices = Array.isArray(body.choices) ? body.choices : [];
-  const choice = isRecord(choices[0]) ? choices[0] : {};
-  const message = isRecord(choice.message) ? choice.message : {};
-  const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
-  if (text !== '') content.push({ type: 'text', text });
-  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  for (const call of calls) {
-    if (!isRecord(call) || !isRecord(call.function)) continue;
-    content.push({
-      type: 'tool_use',
-      id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
-      name: typeof call.function.name === 'string' ? call.function.name : '',
-      input: argumentsOf(call.function.arguments),
-    });
-  }
-  if (content.length === 0) content.push({ type: 'text', text: '' });
-  const usage = wholeUsage(isRecord(body.usage) ? body.usage : {}, text);
   return {
-    id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
+    type: 'error',
+    error: {
+      type,
+      message,
+    },
+  };
+}
+
+/** Format error object conforming to OpenAI error specification */
+export function openAIError(message: string, type: string, code: string | null = null): Json {
+  return {
+    error: {
+      message,
+      type,
+      code,
+    },
+  };
+}
+
+/** Approximate token usage when upstream omits token counts */
+export function wholeUsage(
+  usage: unknown,
+  fallbackText: string
+): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
+  if (isRecord(usage)) {
+    const promptTokens = typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0;
+    const completionTokens = typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0;
+    const totalTokens = typeof usage.total_tokens === 'number' ? usage.total_tokens : promptTokens + completionTokens;
+    return {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: totalTokens,
+    };
+  }
+  const estimated = Math.max(1, Math.ceil(fallbackText.length / 4));
+  return {
+    prompt_tokens: estimated,
+    completion_tokens: estimated,
+    total_tokens: estimated * 2,
+  };
+}
+
+/** Map OpenAI finish_reason to Anthropic stop_reason */
+export function stopReasonOf(finishReason: unknown): string {
+  switch (finishReason) {
+    case 'stop':
+      return 'end_turn';
+    case 'length':
+      return 'max_tokens';
+    case 'tool_calls':
+    case 'function_call':
+      return 'tool_use';
+    default:
+      return 'end_turn';
+  }
+}
+
+/** Format a Server-Sent Event (SSE) frame string with UTF-8 safety */
+export function sseEvent(eventName: string | null, dataPayload: unknown): string {
+  const serialized = typeof dataPayload === 'string' ? dataPayload : JSON.stringify(dataPayload);
+  if (eventName) {
+    return `event: ${eventName}\ndata: ${serialized}\n\n`;
+  }
+  return `data: ${serialized}\n\n`;
+}
+
+/** Translate Anthropic Messages request into OpenAI Chat Completions payload */
+export function anthropicToOpenAI(anthropicBody: Json, targetModel: string): Json {
+  const convertedMessages: Json[] = [];
+
+  // Translate system prompt if provided
+  if (typeof anthropicBody.system === 'string' && anthropicBody.system.trim()) {
+    convertedMessages.push({
+      role: 'system',
+      content: anthropicBody.system,
+    });
+  } else if (Array.isArray(anthropicBody.system)) {
+    const systemParts: string[] = [];
+    for (const item of anthropicBody.system) {
+      if (isRecord(item) && typeof item.text === 'string') {
+        systemParts.push(item.text);
+      }
+    }
+    if (systemParts.length > 0) {
+      convertedMessages.push({
+        role: 'system',
+        content: systemParts.join('\n'),
+      });
+    }
+  }
+
+  // Translate conversation messages
+  const rawMessages = Array.isArray(anthropicBody.messages) ? anthropicBody.messages : [];
+  for (const msg of rawMessages) {
+    if (!isRecord(msg)) continue;
+    const role = typeof msg.role === 'string' ? msg.role : 'user';
+
+    if (typeof msg.content === 'string') {
+      convertedMessages.push({ role, content: msg.content });
+    } else if (Array.isArray(msg.content)) {
+      const parts: Json[] = [];
+      let textAccumulator = '';
+
+      for (const block of msg.content) {
+        if (!isRecord(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string') {
+          textAccumulator += block.text;
+        } else if (block.type === 'image' && isRecord(block.source)) {
+          const src = block.source;
+          const mediaType = src.media_type ?? 'image/jpeg';
+          const base64Data = src.data ?? '';
+          parts.push({
+            type: 'image_url',
+            image_url: { url: `data:${mediaType};base64,${base64Data}` },
+          });
+        }
+      }
+
+      if (parts.length > 0) {
+        if (textAccumulator) {
+          parts.unshift({ type: 'text', text: textAccumulator });
+        }
+        convertedMessages.push({ role, content: parts });
+      } else {
+        convertedMessages.push({ role, content: textAccumulator });
+      }
+    }
+  }
+
+  const result: Json = {
+    model: targetModel,
+    messages: convertedMessages,
+  };
+
+  if (typeof anthropicBody.max_tokens === 'number') {
+    result.max_tokens = anthropicBody.max_tokens;
+  }
+  if (typeof anthropicBody.temperature === 'number') {
+    result.temperature = anthropicBody.temperature;
+  }
+  if (typeof anthropicBody.top_p === 'number') {
+    result.top_p = anthropicBody.top_p;
+  }
+  if (anthropicBody.stream === true) {
+    result.stream = true;
+  }
+
+  // Translate tools definition if present
+  if (Array.isArray(anthropicBody.tools)) {
+    result.tools = anthropicBody.tools.map((t) => {
+      if (!isRecord(t)) return t;
+      return {
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.input_schema,
+        },
+      };
+    });
+  }
+
+  return result;
+}
+
+/** Translate OpenAI Chat Completions reply into Anthropic Messages format */
+export function openAIToAnthropic(openAIReply: Json, targetModel: string): Json {
+  const choices = Array.isArray(openAIReply.choices) ? openAIReply.choices : [];
+  const firstChoice = choices[0] && isRecord(choices[0]) ? choices[0] : {};
+  const messageObj = isRecord(firstChoice.message) ? firstChoice.message : {};
+
+  const contentBlocks: Json[] = [];
+  const rawContent = messageObj.content;
+  if (typeof rawContent === 'string' && rawContent.length > 0) {
+    contentBlocks.push({
+      type: 'text',
+      text: rawContent,
+    });
+  }
+
+  // Handle tool calls translation
+  if (Array.isArray(messageObj.tool_calls)) {
+    for (const toolCall of messageObj.tool_calls) {
+      if (!isRecord(toolCall) || !isRecord(toolCall.function)) continue;
+      let parsedArgs: unknown = {};
+      try {
+        parsedArgs = JSON.parse(String(toolCall.function.arguments ?? '{}'));
+      } catch {
+        parsedArgs = {};
+      }
+      contentBlocks.push({
+        type: 'tool_use',
+        id: toolCall.id ?? 'call_default',
+        name: toolCall.function.name ?? 'unknown_tool',
+        input: parsedArgs,
+      });
+    }
+  }
+
+  const finishReason = firstChoice.finish_reason;
+  const stopReason = stopReasonOf(finishReason);
+  const usageStats = wholeUsage(openAIReply.usage, typeof rawContent === 'string' ? rawContent : '');
+
+  return {
+    id: typeof openAIReply.id === 'string' ? openAIReply.id : `msg_${Date.now()}`,
     type: 'message',
     role: 'assistant',
-    model,
-    content,
-    stop_reason: stopReasonOf(choice.finish_reason),
+    model: targetModel,
+    content: contentBlocks,
+    stop_reason: stopReason,
     stop_sequence: null,
-    usage: { input_tokens: usage.prompt_tokens, output_tokens: usage.completion_tokens },
+    usage: {
+      input_tokens: usageStats.prompt_tokens,
+      output_tokens: usageStats.completion_tokens,
+    },
   };
 }
 
-/** A Chat Completions answer with `model` set to the id the entry dialled, and a whole usage: the one truthful claim. */
-export function openAIJsonWithModel(body: Json, model: string): Json {
-  const choices = Array.isArray(body.choices) ? body.choices : [];
-  const choice = isRecord(choices[0]) ? choices[0] : {};
-  const message = isRecord(choice.message) ? choice.message : {};
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
-  return { ...body, model, usage: wholeUsage(isRecord(body.usage) ? body.usage : {}, text) };
-}
-
-/** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
-export function sseEvent(event: string | null, data: unknown): string {
-  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
-}
-
-/**
- * One SSE frame with every data payload's `model` set to `model`, and its blank line kept:
- * comments, `event:` lines and payloads that are not JSON objects pass through
- * untouched. Chat Completions names the model on its chunks; the client sees the id the
- * entry dialled, never the provider's spelling.
- */
-function frameWithModel(frame: string, model: string): string {
-  const lines = frame.split('\n').map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return line;
-    const payload = trimmed.slice(5).trim();
-    if (payload === '' || payload === '[DONE]') return line;
-    try {
-      const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
-    } catch {
-      // Not JSON: relay the line as it came.
-    }
-    return line;
-  });
-  return `${lines.join('\n')}\n\n`;
-}
-
-/**
- * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model`
- * the id the entry dialled. Frames are split on the blank line that ends them, as the SSE
- * grammar does; a frame cut across reads is held until its end arrives, and a body that
- * ends without one is relayed as it is.
- */
-export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
+/** Stream OpenAI SSE events replacing model identifier */
+export async function* openAIStreamWithModel(
+  upstreamStream: ReadableStream<Uint8Array>,
+  targetModel: string
+): AsyncGenerator<string> {
+  const reader = upstreamStream.getReader();
+  const textDecoder = new TextDecoder();
   let buffer = '';
+
   try {
-    for (;;) {
-      const { value, done } = await reader.read();
+    while (true) {
+      const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
-        at = buffer.indexOf('\n\n');
+
+      buffer += textDecoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          yield '\n';
+          continue;
+        }
+        if (trimmed === 'data: [DONE]') {
+          yield 'data: [DONE]\n\n';
+          continue;
+        }
+        if (trimmed.startsWith('data: ')) {
+          const rawData = trimmed.slice(6);
+          try {
+            const parsed = JSON.parse(rawData);
+            if (isRecord(parsed)) {
+              parsed.model = targetModel;
+              yield `data: ${JSON.stringify(parsed)}\n\n`;
+              continue;
+            }
+          } catch {
+            // Forward raw if parsing fails
+          }
+        }
+        yield `${line}\n`;
       }
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
   } finally {
     reader.releaseLock();
   }
 }
 
-/**
- * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the
- * first chunk, content_block_start/delta/stop per text block or tool call, then
- * message_delta with the stop reason and usage, then message_stop. `model` is the id the
- * entry dialled, named back to the client. The message_delta's output count is at least
- * 1 whenever the stream carried content: a served prompt always produced output.
- */
-export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
+/** Translate OpenAI streaming SSE events into Anthropic SSE protocol events */
+export async function* anthropicEventsFromOpenAI(
+  upstreamStream: ReadableStream<Uint8Array>,
+  targetModel: string
+): AsyncGenerator<string> {
+  const reader = upstreamStream.getReader();
+  const textDecoder = new TextDecoder();
   let buffer = '';
   let started = false;
-  let finished = false;
-  /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
-  let pendingStop: string | null = null;
-  let textIndex = -1;
-  let nextIndex = 0;
-  const toolIndexes = new Map<number, number>();
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let sawContent = false;
-
-  const startEvents = (): string[] => {
-    if (started) return [];
-    started = true;
-    return [
-      sseEvent('message_start', {
-        type: 'message_start',
-        message: {
-          id: 'msg_stream',
-          type: 'message',
-          role: 'assistant',
-          model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: inputTokens, output_tokens: 0 },
-        },
-      }),
-    ];
-  };
-  const closeEvents = (): string[] => {
-    const out: string[] = [];
-    if (textIndex !== -1) {
-      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-      textIndex = -1;
-    }
-    for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
-    toolIndexes.clear();
-    return out;
-  };
-  const finishEvents = (stopReason: string): string[] => {
-    if (finished) return [];
-    finished = true;
-    return [
-      ...closeEvents(),
-      sseEvent('message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: sawContent ? Math.max(1, outputTokens) : outputTokens },
-      }),
-      sseEvent('message_stop', { type: 'message_stop' }),
-    ];
-  };
-
-  /** One SSE frame's lines as Anthropic events, mutating the stream's state. */
-  const eventsOfFrame = (frame: string): string[] => {
-    const out: string[] = [];
-    for (const line of frame.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') {
-        out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
-        continue;
-      }
-      let chunk: unknown;
-      try {
-        chunk = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      if (!isRecord(chunk)) continue;
-      if (isRecord(chunk.usage)) {
-        inputTokens = countOrZero(chunk.usage.prompt_tokens);
-        outputTokens = countOrZero(chunk.usage.completion_tokens);
-      }
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      const choice = isRecord(choices[0]) ? choices[0] : null;
-      if (choice === null) continue;
-      const delta = isRecord(choice.delta) ? choice.delta : {};
-      out.push(...startEvents());
-      if (typeof delta.content === 'string' && delta.content !== '') {
-        sawContent = true;
-        if (textIndex === -1) {
-          textIndex = nextIndex;
-          nextIndex += 1;
-          out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
-        }
-        out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } }));
-      }
-      const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-      for (const call of calls) {
-        if (!isRecord(call)) continue;
-        sawContent = true;
-        const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
-        let index = toolIndexes.get(upstreamIndex);
-        if (index === undefined) {
-          if (textIndex !== -1) {
-            out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-            textIndex = -1;
-          }
-          index = nextIndex;
-          nextIndex += 1;
-          toolIndexes.set(upstreamIndex, index);
-          const fn = isRecord(call.function) ? call.function : {};
-          out.push(
-            sseEvent('content_block_start', {
-              type: 'content_block_start',
-              index,
-              content_block: {
-                type: 'tool_use',
-                id: typeof call.id === 'string' && call.id !== '' ? call.id : `toolu_${index}`,
-                name: typeof fn.name === 'string' ? fn.name : '',
-                input: {},
-              },
-            }),
-          );
-        }
-        const fn = isRecord(call.function) ? call.function : {};
-        if (typeof fn.arguments === 'string' && fn.arguments !== '') {
-          out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
-        }
-      }
-      // Hold the stop reason until the stream's last chunk (the usage one) and [DONE] have
-      // arrived: OpenAI sends the usage after the finish_reason, and Anthropic's
-      // message_delta carries the output tokens.
-      if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
-    }
-    return out;
-  };
+  let index = 0;
+  let accumulatedOutputTokens = 0;
+  const messageId = `msg_${Date.now()}`;
 
   try {
-    for (;;) {
-      const { value, done } = await reader.read();
+    while (true) {
+      const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
+
+      buffer += textDecoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === 'data: [DONE]') continue;
+
+        if (trimmed.startsWith('data: ')) {
+          const rawJson = trimmed.slice(6);
+          let parsed: unknown = null;
+          try {
+            parsed = JSON.parse(rawJson);
+          } catch {
+            continue;
+          }
+
+          if (!isRecord(parsed)) continue;
+
+          // Emit message_start on first valid chunk
+          if (!started) {
+            started = true;
+            yield sseEvent('message_start', {
+              type: 'message_start',
+              message: {
+                id: messageId,
+                type: 'message',
+                role: 'assistant',
+                model: targetModel,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 10, output_tokens: 1 },
+              },
+            });
+            yield sseEvent('content_block_start', {
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: '' },
+            });
+          }
+
+          const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+          const firstChoice = choices[0] && isRecord(choices[0]) ? choices[0] : null;
+
+          if (firstChoice) {
+            const delta = isRecord(firstChoice.delta) ? firstChoice.delta : null;
+            if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
+              accumulatedOutputTokens += Math.max(1, Math.ceil(delta.content.length / 4));
+              yield sseEvent('content_block_delta', {
+                type: 'content_block_delta',
+                index: 0,
+                delta: { type: 'text_delta', text: delta.content },
+              });
+            }
+
+            if (firstChoice.finish_reason) {
+              const stopReason = stopReasonOf(firstChoice.finish_reason);
+              yield sseEvent('content_block_stop', {
+                type: 'content_block_stop',
+                index: 0,
+              });
+              yield sseEvent('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: stopReason, stop_sequence: null },
+                usage: { output_tokens: Math.max(1, accumulatedOutputTokens) },
+              });
+              yield sseEvent('message_stop', { type: 'message_stop' });
+            }
+          }
+        }
       }
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
   } finally {
     reader.releaseLock();
-  }
-  if (!finished) {
-    for (const event of startEvents()) yield event;
-    for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
   }
 }
