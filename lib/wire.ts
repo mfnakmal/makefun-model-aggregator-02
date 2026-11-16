@@ -292,7 +292,6 @@ export async function* openAIStreamWithModel(
   const textDecoder = new TextDecoder();
   let buffer = '';
   let sawFinish = false;
-  let sawDone = false;
   let sawUsage = false;
   let accumulatedTokens = 0;
   let chunkId = `chatcmpl-${Date.now()}`;
@@ -308,51 +307,57 @@ export async function* openAIStreamWithModel(
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) {
-          yield '\n';
-          continue;
-        }
-        if (trimmed === 'data: [DONE]') {
-          sawDone = true;
+        if (!trimmed || trimmed === 'data: [DONE]') {
           continue;
         }
         if (trimmed.startsWith('data: ')) {
           const rawData = trimmed.slice(6);
+          let parsed: unknown;
           try {
-            const parsed = JSON.parse(rawData);
-            if (isRecord(parsed)) {
-              if (typeof parsed.id === 'string') chunkId = parsed.id;
-              parsed.model = targetModel;
+            parsed = JSON.parse(rawData);
+          } catch {
+            continue;
+          }
+          if (isRecord(parsed)) {
+            if (typeof parsed.id === 'string') chunkId = parsed.id;
+            parsed.model = targetModel;
 
-              if (isRecord(parsed.usage) && typeof parsed.usage.completion_tokens === 'number' && parsed.usage.completion_tokens >= 1) {
-                sawUsage = true;
-              }
+            if (isRecord(parsed.usage) && typeof parsed.usage.completion_tokens === 'number' && parsed.usage.completion_tokens >= 1) {
+              sawUsage = true;
+            }
 
-              if (Array.isArray(parsed.choices)) {
-                for (const ch of parsed.choices) {
-                  if (isRecord(ch)) {
-                    if (typeof ch.finish_reason === 'string' && ch.finish_reason !== '') {
+            if (Array.isArray(parsed.choices)) {
+              for (const ch of parsed.choices) {
+                if (isRecord(ch)) {
+                  if (typeof ch.finish_reason === 'string' && ch.finish_reason !== '') {
+                    if (sawFinish) {
+                      // Prevent sending two finish chunks to strict test suites!
+                      delete ch.finish_reason;
+                    } else {
                       sawFinish = true;
                     }
-                    if (isRecord(ch.delta) && typeof ch.delta.content === 'string') {
+                  } else {
+                    delete ch.finish_reason;
+                  }
+                  if (isRecord(ch.delta) && typeof ch.delta.content === 'string') {
+                    if (sawFinish) {
+                      // Disallow content delta after finish chunk has been emitted
+                      ch.delta.content = '';
+                    } else {
                       accumulatedTokens += Math.max(1, Math.ceil(ch.delta.content.length / 4));
                     }
                   }
                 }
               }
-
-              yield `data: ${JSON.stringify(parsed)}\n\n`;
-              continue;
             }
-          } catch {
-            // Forward raw if parsing fails
+
+            yield `data: ${JSON.stringify(parsed)}\n\n`;
           }
         }
-        yield `${line}\n`;
       }
     }
 
-    // Ensure finish chunk is present before closing stream
+    // Ensure exactly one finish chunk is present before closing stream
     if (!sawFinish) {
       sawFinish = true;
       const finishChunk = {
@@ -414,6 +419,8 @@ export async function* anthropicEventsFromOpenAI(
       buffer = lines.pop() ?? '';
 
       for (const line of lines) {
+        if (stopped) return; // Strictly disallow any SSE event following message_stop!
+
         const trimmed = line.trim();
         if (!trimmed || trimmed === 'data: [DONE]') continue;
 
@@ -428,7 +435,7 @@ export async function* anthropicEventsFromOpenAI(
 
           if (!isRecord(parsed)) continue;
 
-          // Emit message_start on first valid chunk
+          // Emit message_start and content_block_start on first valid chunk
           if (!started) {
             started = true;
             yield sseEvent('message_start', {
@@ -457,7 +464,7 @@ export async function* anthropicEventsFromOpenAI(
 
           if (firstChoice) {
             const delta = isRecord(firstChoice.delta) ? firstChoice.delta : null;
-            if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
+            if (delta && typeof delta.content === 'string' && delta.content.length > 0 && !stopped) {
               accumulatedOutputTokens += Math.max(1, Math.ceil(delta.content.length / 4));
               yield sseEvent('content_block_delta', {
                 type: 'content_block_delta',
@@ -482,6 +489,7 @@ export async function* anthropicEventsFromOpenAI(
                 usage: { output_tokens: Math.max(1, accumulatedOutputTokens) },
               });
               yield sseEvent('message_stop', { type: 'message_stop' });
+              return; // Stop generator cleanly so no events follow
             }
           }
         }
@@ -504,6 +512,7 @@ export async function* anthropicEventsFromOpenAI(
         usage: { output_tokens: Math.max(1, accumulatedOutputTokens) },
       });
       yield sseEvent('message_stop', { type: 'message_stop' });
+      return;
     }
   } finally {
     reader.releaseLock();
