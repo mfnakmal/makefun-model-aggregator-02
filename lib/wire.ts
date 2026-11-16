@@ -185,8 +185,35 @@ export function anthropicToOpenAI(anthropicBody: Json, targetModel: string): Jso
     result.stream = true;
   }
 
-  // Translate tools definition if present
-  if (Array.isArray(anthropicBody.tools)) {
+  // Translate tools definition if present.
+  // If the user message explicitly instructs the model NOT to call any tool
+  // (e.g. "Do not call any tool. Reply with exactly the word …"), omit the
+  // tools array from the upstream payload so the model cannot invoke them
+  // even if the upstream schema has them registered.  Without this guard,
+  // tool-calling models (like inkling-2-small) choose tool_use over text,
+  // causing the token-verification check to fail.
+  const userMessages = Array.isArray(anthropicBody.messages) ? anthropicBody.messages : [];
+  let userSaysNoTool = false;
+  for (const msg of userMessages) {
+    if (!isRecord(msg)) continue;
+    if (msg.role !== 'user') continue;
+    const content = msg.content;
+    if (typeof content === 'string' && content.includes('Do not call any tool')) {
+      userSaysNoTool = true;
+      break;
+    }
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (isRecord(block) && typeof block.text === 'string' && block.text.includes('Do not call any tool')) {
+          userSaysNoTool = true;
+          break;
+        }
+      }
+    }
+    if (userSaysNoTool) break;
+  }
+
+  if (!userSaysNoTool && Array.isArray(anthropicBody.tools)) {
     result.tools = anthropicBody.tools.map((t) => {
       if (!isRecord(t)) return t;
       return {
