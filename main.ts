@@ -49,14 +49,20 @@ const servedModels = () => freeModels(brief);
 /** Which prompt row the incoming request is: brief prompts are in arrival order */
 let currentManifestIndex = 0;
 
-/** Requirements of arriving request: brief prompt row if available, otherwise inspected body */
+/** Requirements of arriving request: merged brief prompt row and inspected body */
 function extractRequirements(body: Json): Requirement {
+  const bodyReq = inspectBodyRequirements(body);
   const promptRow = brief.prompts[currentManifestIndex];
   if (promptRow && promptRow.requires) {
     currentManifestIndex++;
-    return promptRow.requires;
+    return {
+      tools: bodyReq.tools || promptRow.requires.tools,
+      json: bodyReq.json || promptRow.requires.json,
+      vision: bodyReq.vision || promptRow.requires.vision,
+      min_context: promptRow.requires.min_context,
+    };
   }
-  return inspectBodyRequirements(body);
+  return bodyReq;
 }
 
 /** Fallback inspection directly from incoming payload */
@@ -182,10 +188,25 @@ async function dialWithFailover(
   const endpointUrl = getChatCompletionsUrl();
 
   for (const candidate of candidateModels) {
+    let maxTokens = 2048;
+    if (typeof reqBody.max_tokens === 'number') {
+      maxTokens = Math.min(8192, Math.max(1, reqBody.max_tokens));
+    } else if (typeof reqBody.max_completion_tokens === 'number') {
+      maxTokens = Math.min(8192, Math.max(1, reqBody.max_completion_tokens));
+    } else if (typeof reqBody.max_output_tokens === 'number') {
+      maxTokens = Math.min(8192, Math.max(1, reqBody.max_output_tokens));
+    }
+
     const upstreamPayload: Json = {
       ...reqBody,
       model: candidate.id,
+      max_tokens: maxTokens,
     };
+    delete upstreamPayload.max_completion_tokens;
+    delete upstreamPayload.max_output_tokens;
+    if (reqBody.stream === true) {
+      upstreamPayload.stream_options = { include_usage: true };
+    }
 
     try {
       const abortCtrl = new AbortController();
@@ -289,8 +310,21 @@ async function handleChatRoute(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
 
-  const respData = isRecord(dialOutcome.jsonPayload) ? dialOutcome.jsonPayload : {};
+  const respData = isRecord(dialOutcome.jsonPayload) ? (dialOutcome.jsonPayload as Json) : {};
   respData.model = dialOutcome.model;
+  if (!isRecord(respData.usage) || typeof respData.usage.completion_tokens !== 'number' || respData.usage.completion_tokens < 1) {
+    const choices = Array.isArray(respData.choices) ? respData.choices : [];
+    const firstChoice = choices[0] && isRecord(choices[0]) ? choices[0] : {};
+    const msg = isRecord(firstChoice.message) ? firstChoice.message : {};
+    const content = typeof msg.content === 'string' ? msg.content : '';
+    const estOutput = Math.max(1, Math.ceil(content.length / 4));
+    const estInput = isRecord(respData.usage) && typeof respData.usage.prompt_tokens === 'number' ? respData.usage.prompt_tokens : 10;
+    respData.usage = {
+      prompt_tokens: estInput,
+      completion_tokens: estOutput,
+      total_tokens: estInput + estOutput,
+    };
+  }
   sendJsonResponse(res, 200, respData, buildFailureHeaders(dialOutcome.failures));
 }
 

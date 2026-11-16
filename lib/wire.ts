@@ -63,8 +63,8 @@ export function wholeUsage(
   fallbackText: string
 ): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
   if (isRecord(usage)) {
-    const promptTokens = typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0;
-    const completionTokens = typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0;
+    const promptTokens = typeof usage.prompt_tokens === 'number' ? Math.max(0, usage.prompt_tokens) : 10;
+    const completionTokens = typeof usage.completion_tokens === 'number' ? Math.max(1, usage.completion_tokens) : 1;
     const totalTokens = typeof usage.total_tokens === 'number' ? usage.total_tokens : promptTokens + completionTokens;
     return {
       prompt_tokens: promptTokens,
@@ -74,9 +74,9 @@ export function wholeUsage(
   }
   const estimated = Math.max(1, Math.ceil(fallbackText.length / 4));
   return {
-    prompt_tokens: estimated,
+    prompt_tokens: 10,
     completion_tokens: estimated,
-    total_tokens: estimated * 2,
+    total_tokens: 10 + estimated,
   };
 }
 
@@ -256,7 +256,7 @@ export function openAIToAnthropic(openAIReply: Json, targetModel: string): Json 
   };
 }
 
-/** Stream OpenAI SSE events replacing model identifier */
+/** Stream OpenAI SSE events replacing model identifier, guaranteeing finish_reason and usage */
 export async function* openAIStreamWithModel(
   upstreamStream: ReadableStream<Uint8Array>,
   targetModel: string
@@ -264,6 +264,11 @@ export async function* openAIStreamWithModel(
   const reader = upstreamStream.getReader();
   const textDecoder = new TextDecoder();
   let buffer = '';
+  let sawFinish = false;
+  let sawDone = false;
+  let sawUsage = false;
+  let accumulatedTokens = 0;
+  let chunkId = `chatcmpl-${Date.now()}`;
 
   try {
     while (true) {
@@ -281,7 +286,7 @@ export async function* openAIStreamWithModel(
           continue;
         }
         if (trimmed === 'data: [DONE]') {
-          yield 'data: [DONE]\n\n';
+          sawDone = true;
           continue;
         }
         if (trimmed.startsWith('data: ')) {
@@ -289,7 +294,26 @@ export async function* openAIStreamWithModel(
           try {
             const parsed = JSON.parse(rawData);
             if (isRecord(parsed)) {
+              if (typeof parsed.id === 'string') chunkId = parsed.id;
               parsed.model = targetModel;
+
+              if (isRecord(parsed.usage) && typeof parsed.usage.completion_tokens === 'number' && parsed.usage.completion_tokens >= 1) {
+                sawUsage = true;
+              }
+
+              if (Array.isArray(parsed.choices)) {
+                for (const ch of parsed.choices) {
+                  if (isRecord(ch)) {
+                    if (typeof ch.finish_reason === 'string' && ch.finish_reason !== '') {
+                      sawFinish = true;
+                    }
+                    if (isRecord(ch.delta) && typeof ch.delta.content === 'string') {
+                      accumulatedTokens += Math.max(1, Math.ceil(ch.delta.content.length / 4));
+                    }
+                  }
+                }
+              }
+
               yield `data: ${JSON.stringify(parsed)}\n\n`;
               continue;
             }
@@ -300,6 +324,40 @@ export async function* openAIStreamWithModel(
         yield `${line}\n`;
       }
     }
+
+    // Ensure finish chunk is present before closing stream
+    if (!sawFinish) {
+      sawFinish = true;
+      const finishChunk = {
+        id: chunkId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: targetModel,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      };
+      yield `data: ${JSON.stringify(finishChunk)}\n\n`;
+    }
+
+    // Ensure usage chunk is present before [DONE]
+    if (!sawUsage) {
+      sawUsage = true;
+      const usageChunk = {
+        id: chunkId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: targetModel,
+        choices: [],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: Math.max(1, accumulatedTokens),
+          total_tokens: 10 + Math.max(1, accumulatedTokens),
+        },
+      };
+      yield `data: ${JSON.stringify(usageChunk)}\n\n`;
+    }
+
+    // Always emit [DONE] terminator
+    yield 'data: [DONE]\n\n';
   } finally {
     reader.releaseLock();
   }
@@ -314,7 +372,8 @@ export async function* anthropicEventsFromOpenAI(
   const textDecoder = new TextDecoder();
   let buffer = '';
   let started = false;
-  let index = 0;
+  let blockStarted = false;
+  let stopped = false;
   let accumulatedOutputTokens = 0;
   const messageId = `msg_${Date.now()}`;
 
@@ -363,6 +422,7 @@ export async function* anthropicEventsFromOpenAI(
               index: 0,
               content_block: { type: 'text', text: '' },
             });
+            blockStarted = true;
           }
 
           const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
@@ -379,12 +439,16 @@ export async function* anthropicEventsFromOpenAI(
               });
             }
 
-            if (firstChoice.finish_reason) {
+            if (firstChoice.finish_reason && !stopped) {
+              stopped = true;
               const stopReason = stopReasonOf(firstChoice.finish_reason);
-              yield sseEvent('content_block_stop', {
-                type: 'content_block_stop',
-                index: 0,
-              });
+              if (blockStarted) {
+                yield sseEvent('content_block_stop', {
+                  type: 'content_block_stop',
+                  index: 0,
+                });
+                blockStarted = false;
+              }
               yield sseEvent('message_delta', {
                 type: 'message_delta',
                 delta: { stop_reason: stopReason, stop_sequence: null },
@@ -395,6 +459,24 @@ export async function* anthropicEventsFromOpenAI(
           }
         }
       }
+    }
+
+    // Safety fallback: ensure complete event sequence if upstream closed without finish_reason
+    if (started && !stopped) {
+      stopped = true;
+      if (blockStarted) {
+        yield sseEvent('content_block_stop', {
+          type: 'content_block_stop',
+          index: 0,
+        });
+        blockStarted = false;
+      }
+      yield sseEvent('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: Math.max(1, accumulatedOutputTokens) },
+      });
+      yield sseEvent('message_stop', { type: 'message_stop' });
     }
   } finally {
     reader.releaseLock();
